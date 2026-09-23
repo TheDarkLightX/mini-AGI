@@ -151,3 +151,58 @@ more experts
 For a new-model V2 experiment, `pool.top_k=1` is now the evidence-backed
 localization arm. The existing default stays unchanged in this PR so old
 checkpoints and upstream behavior are not silently redefined.
+
+
+## Tokenizer direction: keep bytes, learn compression inside the model
+
+mini-AGI already has a tokenizer in the literal sense: a fixed byte alphabet
+plus structural markers. It does not have a learned BPE/SentencePiece
+vocabulary.
+
+For a lifetime learner, stable byte IDs are attractive because the meaning of
+the input/output IDs never changes as the data distribution changes. Replacing
+or refitting a subword vocabulary later would move the representation
+underneath every learned embedding and output weight.
+
+Recent byte-model results also weaken the case that subword tokenization is
+necessary for efficiency:
+
+- **Byte Latent Transformer (BLT)** uses entropy-based variable-length byte
+  patches and reports tokenized-LM-level performance at scale while retaining
+  raw-byte robustness.
+- **H-Net** learns content- and context-dependent byte chunking jointly with the
+  language model; compute/data-matched byte H-Net outperforms a strong BPE
+  Transformer in its reported setting.
+- **ByteFlow** uses compression-driven adaptive byte segmentation and reports
+  improvements over BPE and prior byte-level baselines.
+
+The architectural target for V2 is therefore:
+
+```
+stable byte IDs
+    -> local byte encoder / learned dynamic chunking
+    -> shorter latent sequence
+    -> recurrent global model + experts
+    -> byte decoder
+```
+
+rather than:
+
+```
+mutable external tokenizer -> model
+```
+
+A frozen BPE tokenizer remains useful as an experimental baseline. Any
+tokenization comparison must be normalized to **bits per raw byte** and matched
+compute; loss per token is not comparable when one arm changes the unit of
+sequence length.
+
+References:
+
+- Pagnoni et al., *Byte Latent Transformer: Patches Scale Better Than Tokens*,
+  ACL 2025: https://aclanthology.org/2025.acl-long.453/
+- Hwang, Wang & Gu, *Dynamic Chunking for End-to-End Hierarchical Sequence
+  Modeling*: https://arxiv.org/abs/2507.07955
+- Deng et al., *ByteFlow: Language Modeling through Adaptive Byte Compression
+  without a Tokenizer*, ICLR 2026:
+  https://proceedings.iclr.cc/paper_files/paper/2026/hash/eaf5d2cdb582c058a078d4fdf52a20f9-Abstract-Conference.html
