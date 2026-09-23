@@ -61,12 +61,12 @@ def lr_at(step, total, base, warmup, floor_frac=0.1):
 
 
 def _resync_opt(opt, model, args):
-    """Drop parameters the model no longer has, adopt the ones it gained.
+    """Drop dead parameters and adopt growth into the correct plasticity role.
 
-    Growth appends experts and replaces the gate tensor; pruning removes them
-    and replaces it again. Either way the optimiser is left holding tensors the
-    model does not have - Adam would keep stepping them and keep their moments
-    alive, a leak on a pool that grows and shrinks all run.
+    Growth can replace the gate and router tensors as well as create expert
+    capacity. Treating every fresh tensor as a fast "pool" parameter silently
+    undoes router consolidation after the first growth event, so new parameters
+    are classified with the same trunk/router/expert partition used at startup.
     """
     live = {id(p) for p in model.parameters()}
     for g in opt.param_groups:
@@ -74,21 +74,39 @@ def _resync_opt(opt, model, args):
             if id(p_) not in live:
                 opt.state.pop(p_, None)
         g["params"] = [p for p in g["params"] if id(p) in live]
+
     known = {id(p) for g in opt.param_groups for p in g["params"]}
     fresh = [p for p in model.parameters() if id(p) not in known]
-    mats = [p for p in fresh if p.dim() >= 2]
-    vecs = [p for p in fresh if p.dim() < 2]
-    # a group added mid-run needs the anchor the schedule scales from, or it
-    # would sit at whatever rate it was born with while everything else decays
-    base = args.lr
-    if mats:
-        opt.add_param_group({"params": mats, "name": "pool",
-                             "weight_decay": args.wd,
-                             "lr": base, "base_lr": base})
-    if vecs:
-        opt.add_param_group({"params": vecs, "name": "pool",
-                             "weight_decay": 0.0,
-                             "lr": base, "base_lr": base})
+    if not fresh:
+        return
+
+    trunk, routers, experts = _split_trunk_router_experts(model)
+    role_ids = {
+        "trunk": {id(p) for p in trunk},
+        "routers": {id(p) for p in routers},
+        "experts": {id(p) for p in experts},
+    }
+    mult = {
+        "trunk": float(getattr(args, "trunk_lr_mult", 1.0)),
+        "routers": float(getattr(args, "router_lr_mult", 1.0)),
+        "experts": 1.0,
+    }
+    for role in ("trunk", "routers", "experts"):
+        ps = [p for p in fresh if id(p) in role_ids[role]]
+        for decay, subset in (
+            (args.wd, [p for p in ps if p.dim() >= 2]),
+            (0.0, [p for p in ps if p.dim() < 2]),
+        ):
+            if not subset:
+                continue
+            base = args.lr * mult[role]
+            opt.add_param_group({
+                "params": subset,
+                "name": role,
+                "weight_decay": decay,
+                "lr": base,
+                "base_lr": base,
+            })
 
 
 def cmd_stream(args):
@@ -668,19 +686,24 @@ def cmd_read(args):
                 n_off += 1
         print(f"  pool activations kept, not recomputed ({n_off} call sites) "
               f"- faster, and it needs the memory depth was using")
-    trunk, pool_ps = _split_trunk_pool(model)
+    trunk, router_ps, expert_ps = _split_trunk_router_experts(model)
 
     tg = {"params": trunk, "name": "trunk", "weight_decay": args.wd,
           "lr": args.lr * args.trunk_lr_mult,
           "base_lr": args.lr * args.trunk_lr_mult}
-    pg = {"params": pool_ps, "name": "pool", "weight_decay": args.wd,
+    rg = {"params": router_ps, "name": "routers", "weight_decay": args.wd,
+          "lr": args.lr * args.router_lr_mult,
+          "base_lr": args.lr * args.router_lr_mult}
+    eg = {"params": expert_ps, "name": "experts", "weight_decay": args.wd,
           "lr": args.lr, "base_lr": args.lr}
-    opt = torch.optim.AdamW([tg, pg], lr=args.lr, betas=(0.9, 0.95),
+    opt = torch.optim.AdamW([tg, rg, eg], lr=args.lr, betas=(0.9, 0.95),
                             fused=(device.type == "cuda"))
     snr = GradSNR()
-    print(f"  trunk learns at {args.trunk_lr_mult:g}x the pool's rate "
+    print(f"  plasticity: trunk {args.trunk_lr_mult:g}x, "
+          f"routing {args.router_lr_mult:g}x, expert content 1x "
           f"({sum(q.numel() for q in trunk)/1e6:.1f}M trunk, "
-          f"{sum(q.numel() for q in pool_ps)/1e6:.1f}M pool)")
+          f"{sum(q.numel() for q in router_ps)/1e6:.2f}M routing, "
+          f"{sum(q.numel() for q in expert_ps)/1e6:.1f}M resident experts)")
 
     # Scored at the window the model is actually reading at. A fixed
     # reference window would be steadier, but it would stop describing the
@@ -1795,6 +1818,59 @@ def _split_trunk_pool(model):
     return trunk, pool
 
 
+def _split_trunk_router_experts(model):
+    """Three-timescale partition for continual learning.
+
+    Expert CONTENT may adapt quickly. Routing is different: changing a router
+    can erase an old capability without touching the expert that stores it,
+    simply by no longer selecting that expert for the old input. The previous
+    two-way split put routers, segment routing and gates at the same fast rate
+    as expert content. This function makes that architectural choice explicit.
+
+    For a paged pool, w1/w3/w2 are VRAM expert slots and are expert content.
+    For a resident pool, the ModuleList of experts is expert content. Gates,
+    per-token routers, depth embeddings and the segment router are routing.
+    Everything else is the globally shared trunk.
+    """
+    p = model.pool
+    router_ids = {id(p.gate)}
+    expert_ids = set()
+
+    if hasattr(p, "experts") and p.experts is not None:
+        expert_ids |= {id(q) for e in p.experts for q in e.parameters()}
+
+    for nm in ("w1", "w3", "w2"):
+        obj = getattr(p, nm, None)
+        if obj is None:
+            continue
+        expert_ids |= ({id(obj)} if torch.is_tensor(obj)
+                       else {id(q) for q in obj.parameters()})
+
+    sr = getattr(p, "segment_router", None)
+    if sr is not None:
+        router_ids |= {id(q) for q in sr.parameters()}
+
+    for s in model.modules():
+        if isinstance(s, PooledMLP):
+            router_ids.add(id(s.router.weight))
+            router_ids.add(id(s.depth_emb))
+
+    all_ids = {id(q) for q in model.parameters()}
+    overlap = router_ids & expert_ids
+    if overlap:
+        raise RuntimeError("router/expert parameter partition overlaps")
+    trunk_ids = all_ids - router_ids - expert_ids
+
+    trunk = [q for q in model.parameters() if id(q) in trunk_ids]
+    routers = [q for q in model.parameters() if id(q) in router_ids]
+    experts = [q for q in model.parameters() if id(q) in expert_ids]
+
+    if ({id(q) for q in trunk} | {id(q) for q in routers}
+            | {id(q) for q in experts}) != all_ids:
+        raise RuntimeError("parameter partition is incomplete")
+    return trunk, routers, experts
+
+
 def build_paged(wdir, device, resident=None, ram_capacity=256, ceiling=None,
                 read_only=False):
     """
@@ -2220,6 +2296,12 @@ def main():
                     default=_cfg(_c, "training.trunk_lr_mult", 0.3),
                     help="the trunk is shared by every domain and is where "
                          "forgetting happens; it learns slower on purpose")
+    rd.add_argument("--router-lr-mult", type=float,
+                    default=_cfg(_c, "training.router_lr_mult", 1.0),
+                    help="router/gate LR divided by expert-content LR. "
+                         "1 preserves the original mini-AGI behaviour; lower "
+                         "values consolidate routing so old inputs keep reaching "
+                         "the experts that learned them")
     rd.add_argument("--grow-mem-frac", type=float,
                     default=_cfg(_c, "growth.mem_frac", 0.85))
     rd.set_defaults(fn=cmd_read)
