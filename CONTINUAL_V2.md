@@ -42,10 +42,12 @@ The real `read` path now optionally keeps a fixed-size reservoir of previously
 seen passage references. A replay mark contains only:
 
 ```
-(subject, file path, byte-token offset)
+(subject, file path, byte-token offset, file size, file mtime)
 ```
 
-No text is copied into the reservoir. When replay fires, an old passage is
+No text is copied into the reservoir. Size/mtime fingerprinting prevents an
+offset in a rewritten file from being mislabeled as an old memory; stale marks
+are discarded lazily. When replay fires, an old passage is
 re-opened and learned through the same full-context `FileReader` path as its
 first exposure.
 
