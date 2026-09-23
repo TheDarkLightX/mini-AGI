@@ -93,6 +93,13 @@ training:
                           # tests whether lowering this prevents routing drift:
                           # an old capability can be lost even with unchanged
                           # expert weights if old inputs stop reaching it.
+
+  # Bounded episodic replay for the real `read` path. Replay replaces a share
+  # of fresh visits rather than adding extra steps, so compute stays fixed.
+  replay: 0.0             # 0 preserves upstream behaviour; experiment with .1-.25
+  replay_marks: 512       # reservoir of old (file, offset) passage references
+  replay_state: ""        # optional JSON persistence; intentionally not in weights/
+                          # because even corpus file names may be sensitive
   weight_decay: 0.1
   clip: 1.0
 
