@@ -583,15 +583,15 @@ class _ReplayMemory:
         if j < self.capacity:
             self.marks[j] = mark
 
-    def sample(self, subject, rng):
+    def sample(self, rng):
+        """Draw from the whole lifetime reservoir, across subject boundaries."""
         if not self.marks:
             return None
-        cand = [m for m in self.marks if m["subject"] == subject]
-        if not cand:
-            return None
-        m = cand[int(rng.integers(0, len(cand)))]
+        m = self.marks[int(rng.integers(0, len(self.marks)))]
+        return dict(m)
+
+    def note_replay(self):
         self.replays += 1
-        return m["path"], int(m["pos"])
 
     def save(self):
         if not self.state_path or self.capacity <= 0:
@@ -1158,22 +1158,36 @@ def cmd_read(args):
     while not stop and seen < target:
         for lane in lanes:
             mark = None
+            visit_lane = lane
             if (args.replay > 0 and replay_mem.marks
                     and lane.rng.random() < args.replay):
-                mark = replay_mem.sample(lane.name, lane.rng)
-            r = lane.open(model, args.chunk, ctx_now, device,
-                          turn * args.chunk, at=mark)
+                mark = replay_mem.sample(lane.rng)
+                if mark is not None:
+                    # Replay is deliberately GLOBAL, not current-subject-only.
+                    # Continual learning is the case where old subject A may no
+                    # longer be in today's input set at all. The saved path is
+                    # enough to resurrect that passage while it still exists.
+                    visit_lane = _Lane(
+                        mark["subject"], [mark["path"]], lane.rng
+                    )
+            at = ((mark["path"], int(mark["pos"]))
+                  if mark is not None else None)
+            r = visit_lane.open(model, args.chunk, ctx_now, device,
+                                turn * args.chunk, at=at)
             if r is None and mark is not None:
-                # The corpus may have changed since this mark was recorded.
-                # A stale replay reference costs one miss, not the run.
+                # The old corpus may have moved or been deleted. Fall back to
+                # fresh data and do not count the failed replay attempt.
+                visit_lane = lane
                 r = lane.open(model, args.chunk, ctx_now, device,
                               turn * args.chunk)
+            elif r is not None and mark is not None:
+                replay_mem.note_replay()
             if r is None:
                 continue
             path, data = r.name, r.data
             start_pos = int(r.pos)
             if not getattr(r, "replay", False):
-                replay_mem.add(lane.name, path, start_pos, lane.rng)
+                replay_mem.add(visit_lane.name, path, start_pos, lane.rng)
             fl = []
             for j in range(turn):
                 if r.done():
@@ -1202,7 +1216,7 @@ def cmd_read(args):
                     if tracer is not None and not tracer.done():
                         # j == 0 is the chunk that opens this lane's window -
                         # the only point where the subject actually changes
-                        tracer.add_swap(lane, moved, j == 0)
+                        tracer.add_swap(visit_lane, moved, j == 0)
                 # One rate, scaled by the plasticity controller. It moves
                 # only when held-out says something has changed - down on a
                 # plateau, back up when the ground moves - so there is no
@@ -1220,7 +1234,7 @@ def cmd_read(args):
                     with capture_routes() as got:
                         loss = r.step(learn=True, aux_weight=cfg.pool_aux)
                     if loss is not None and got:
-                        tracer.add(got, pool, lane, moved, step, float(loss),
+                        tracer.add(got, pool, visit_lane, moved, step, float(loss),
                                    seen, nxt)
                 else:
                     loss = r.step(learn=True, aux_weight=cfg.pool_aux)
@@ -1411,11 +1425,11 @@ def cmd_read(args):
                     print(f"    weights/ checkpointed at step {step:,} "
                           f"({seen/1e6:.1f}M characters)", flush=True)
                 stop = True
-            lane.rest(model)               # the window is done; free its cache
+            visit_lane.rest(model)         # the window is done; free its cache
             if fl:
                 losses.append(float(np.mean(fl)))
                 if args.verbose:
-                    print(f"  {lane.name:<12} {os.path.relpath(path):<44} "
+                    print(f"  {visit_lane.name:<12} {os.path.relpath(path):<44} "
                           f"{len(data)/1e3:>7.1f}k chars  loss {losses[-1]:.4f}",
                           flush=True)
             if stop or seen >= target:
