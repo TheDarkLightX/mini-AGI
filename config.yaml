@@ -87,8 +87,12 @@ training:
   # improvement, stepping it back up when held-out jumps and stays there.
   chunk: 2048             # characters between steps within the window
   lr: 3.0e-4
-  trunk_lr_mult: 0.1      # the trunk is shared by every domain and is where
-                          # forgetting happens; it learns slower on purpose
+  trunk_lr_mult: 0.1      # globally shared representation learns slowly
+  router_lr_mult: 1.0     # routing/gates relative to expert-content LR.
+                          # 1.0 preserves the original behaviour. Experiment1
+                          # tests whether lowering this prevents routing drift:
+                          # an old capability can be lost even with unchanged
+                          # expert weights if old inputs stop reaching it.
   weight_decay: 0.1
   clip: 1.0
 
