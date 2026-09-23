@@ -5,7 +5,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
+from pathlib import Path
+
+# Running this file as `python scripts/check_continual_v2.py` otherwise makes
+# scripts/ the import root rather than the repository root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 import torch
