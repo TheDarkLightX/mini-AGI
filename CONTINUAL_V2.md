@@ -89,3 +89,65 @@ Do not tune all knobs at once.
 
 The goal is a Pareto frontier over retention, new-data acquisition, held-out
 loss, compute and memory. No single forgetting number is sufficient.
+
+
+## Existing Experiment1 evidence: localization beats scale
+
+Two completed mini-AGI architecture sweeps narrow the next design substantially.
+
+### More experts are not the retention mechanism
+
+Milestone 3A varied the expert pool from 4 to 48 experts at fixed top-k=2.
+At trunk alpha=0.01 the forgetting reductions versus each architecture's
+alpha=1 baseline were:
+
+| experts | forgetting reduction |
+|---:|---:|
+| 4 | 74.9% |
+| 8 | 76.4% |
+| 12 | 76.7% |
+| 24 | 77.2% |
+| 48 | 75.2% |
+
+Spearman correlation between log2(pool size) and the reduction was only 0.40,
+and E=48 was 1.47 percentage points *worse* than E=12. The preregistered scale
+hypothesis failed. Capacity growth may still be useful when capacity is
+genuinely exhausted, but increasing expert count is not supported as a
+catastrophic-forgetting fix.
+
+### Local writes are a retention mechanism
+
+Milestone 3B held the pool at 24 experts and changed top-k. Under alpha=0.01:
+
+| top-k | positive forgetting | target acquisition | final mean loss |
+|---:|---:|---:|---:|
+| **1** | **0.0889** | 0.0919 | **2.7826** |
+| 2 | 0.1472 | 0.1199 | 2.7985 |
+| 4 | 0.1511 | 0.1239 | 2.7919 |
+| 8 | 0.1490 | 0.1106 | 2.7927 |
+
+Top-k=1 had 40.3% lower forgetting than top-k=8 and won all six matched
+seed-by-target comparisons. The preregistered localization hypothesis passed.
+
+The interaction matters. At alpha=1, top-k=1 and top-k=8 had nearly identical
+aggregate forgetting (0.6620 vs 0.6669). Sparse routing becomes protective when
+the globally shared path is already slow.
+
+The resulting V2 hypothesis is therefore:
+
+```
+slow global writes
++ maximally local expert writes
++ consolidating routing
++ bounded replay
+```
+
+not:
+
+```
+more experts
+```
+
+For a new-model V2 experiment, `pool.top_k=1` is now the evidence-backed
+localization arm. The existing default stays unchanged in this PR so old
+checkpoints and upstream behavior are not silently redefined.
