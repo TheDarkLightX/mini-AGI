@@ -563,6 +563,11 @@ class _ReplayMemory:
                 with open(self.state_path) as f:
                     d = json.load(f)
                 self.seen = int(d.get("seen", 0) or 0)
+                if isinstance(d.get("rng_state"), dict):
+                    try:
+                        self.rng.bit_generator.state = d["rng_state"]
+                    except (ValueError, TypeError):
+                        pass
                 got = d.get("marks") or []
                 self.marks = [
                     {"subject": str(m["subject"]), "path": str(m["path"]),
@@ -638,8 +643,9 @@ class _ReplayMemory:
             os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
             tmp = self.state_path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump({"version": 1, "seen": self.seen,
+                json.dump({"version": 2, "seen": self.seen,
                            "capacity": self.capacity,
+                           "rng_state": self.rng.bit_generator.state,
                            "marks": self.marks}, f)
             os.replace(tmp, self.state_path)
         except OSError as e:
