@@ -1,0 +1,44 @@
+name: continual-v2-check
+
+on:
+  push:
+    branches:
+      - continual-v2-router-replay
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile Python sources
+        run: python -m py_compile train.py minagi/*.py corpora/*.py serve.py scripts/check_continual_v2.py
+      - name: Verify V2 hooks are present
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          text = Path("train.py").read_text()
+          tree = ast.parse(text)
+          names = {n.name for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+          assert "_ReplayMemory" in names
+          assert "_split_trunk_router_experts" in names
+          assert "--router-lr-mult" in text
+          assert "--replay-state" in text
+          print("continual-v2 static invariants: OK")
+          PY
+      - name: Install runtime dependencies
+        run: |
+          pip install numpy pyyaml
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Run continual V2 invariants
+        run: python scripts/check_continual_v2.py

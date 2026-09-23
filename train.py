@@ -61,12 +61,12 @@ def lr_at(step, total, base, warmup, floor_frac=0.1):
 
 
 def _resync_opt(opt, model, args):
-    """Drop parameters the model no longer has, adopt the ones it gained.
+    """Drop dead parameters and adopt growth into the correct plasticity role.
 
-    Growth appends experts and replaces the gate tensor; pruning removes them
-    and replaces it again. Either way the optimiser is left holding tensors the
-    model does not have - Adam would keep stepping them and keep their moments
-    alive, a leak on a pool that grows and shrinks all run.
+    Growth can replace the gate and router tensors as well as create expert
+    capacity. Treating every fresh tensor as a fast "pool" parameter silently
+    undoes router consolidation after the first growth event, so new parameters
+    are classified with the same trunk/router/expert partition used at startup.
     """
     live = {id(p) for p in model.parameters()}
     for g in opt.param_groups:
@@ -74,21 +74,39 @@ def _resync_opt(opt, model, args):
             if id(p_) not in live:
                 opt.state.pop(p_, None)
         g["params"] = [p for p in g["params"] if id(p) in live]
+
     known = {id(p) for g in opt.param_groups for p in g["params"]}
     fresh = [p for p in model.parameters() if id(p) not in known]
-    mats = [p for p in fresh if p.dim() >= 2]
-    vecs = [p for p in fresh if p.dim() < 2]
-    # a group added mid-run needs the anchor the schedule scales from, or it
-    # would sit at whatever rate it was born with while everything else decays
-    base = args.lr
-    if mats:
-        opt.add_param_group({"params": mats, "name": "pool",
-                             "weight_decay": args.wd,
-                             "lr": base, "base_lr": base})
-    if vecs:
-        opt.add_param_group({"params": vecs, "name": "pool",
-                             "weight_decay": 0.0,
-                             "lr": base, "base_lr": base})
+    if not fresh:
+        return
+
+    trunk, routers, experts = _split_trunk_router_experts(model)
+    role_ids = {
+        "trunk": {id(p) for p in trunk},
+        "routers": {id(p) for p in routers},
+        "experts": {id(p) for p in experts},
+    }
+    mult = {
+        "trunk": float(getattr(args, "trunk_lr_mult", 1.0)),
+        "routers": float(getattr(args, "router_lr_mult", 1.0)),
+        "experts": 1.0,
+    }
+    for role in ("trunk", "routers", "experts"):
+        ps = [p for p in fresh if id(p) in role_ids[role]]
+        for decay, subset in (
+            (args.wd, [p for p in ps if p.dim() >= 2]),
+            (0.0, [p for p in ps if p.dim() < 2]),
+        ):
+            if not subset:
+                continue
+            base = args.lr * mult[role]
+            opt.add_param_group({
+                "params": subset,
+                "name": role,
+                "weight_decay": decay,
+                "lr": base,
+                "base_lr": base,
+            })
 
 
 def cmd_stream(args):
@@ -451,19 +469,35 @@ class _Lane:
         self.r = None
         self.visits = 0
 
-    def open(self, model, chunk, block, device, span=None):
+    def open(self, model, chunk, block, device, span=None, at=None):
         """
-        Open a file for this visit.
+        Open a file for this visit, optionally at a remembered old position.
 
-        `block` is the context window; `span` is how much will be read before
-        the reader moves to another subject, which may be several windows. The
-        offset has to leave room for the whole visit, not just the first
-        window, or the file runs out part way through and the visit is cut
-        short.
+        `at=(path, position)` is episodic replay. It re-opens the same raw
+        passage the model saw before, so replay has the same context semantics
+        as first exposure instead of feeding isolated chunks with an empty
+        cache. A missing/changed file simply makes the replay miss; the caller
+        can fall back to a fresh visit.
         """
         from minagi.stream import FileReader
         from minagi.ingest import as_stream
         span = max(span or block, block)
+
+        if at is not None:
+            path, pos = at
+            try:
+                data = as_stream(path)
+            except OSError:
+                return None
+            if len(data) < 8 or int(pos) >= len(data) - 1:
+                return None
+            r = FileReader(model, data, path, chunk, block, device)
+            r.pos = max(0, int(pos))
+            r.replay = True
+            self.r = r
+            self.visits += 1
+            return r
+
         for _ in range(8):                       # a few tries for short files
             path = self.paths[int(self.rng.integers(0, len(self.paths)))]
             try:
@@ -480,6 +514,7 @@ class _Lane:
             r = FileReader(model, data, path, chunk, block, device)
             if len(data) > span + 1:
                 r.pos = int(self.rng.integers(0, len(data) - span - 1))
+            r.replay = False
             self.r = r
             self.visits += 1
             return r
@@ -498,6 +533,123 @@ class _Lane:
         if self.r is not None:
             self.r.seen = 0
             self.r = None
+
+
+class _ReplayMemory:
+    """Bounded reservoir of old passage references for task-free replay.
+
+    A mark is only (subject, path, offset), never a copy of the user's text.
+    Persistence is opt-in through --replay-state because even file names can be
+    sensitive and should not be silently embedded in a shareable model
+    checkpoint. With no state path the reservoir is session-local.
+
+    Reservoir sampling makes every fresh passage seen over the model's lifetime
+    equally likely to remain in the fixed-size memory.
+    """
+
+    def __init__(self, capacity=0, state_path="", seed=0):
+        self.capacity = max(0, int(capacity or 0))
+        self.state_path = state_path or ""
+        # Replay owns its randomness. It must never advance a lane's RNG:
+        # replay=0 must reproduce the exact same fresh passages as before this
+        # feature existed, and replay>0 should replace visits without changing
+        # which fresh passage would have come next.
+        self.rng = np.random.default_rng(seed)
+        self.marks = []
+        self.seen = 0
+        self.replays = 0
+        if self.state_path and os.path.exists(self.state_path):
+            try:
+                with open(self.state_path) as f:
+                    d = json.load(f)
+                self.seen = int(d.get("seen", 0) or 0)
+                if isinstance(d.get("rng_state"), dict):
+                    try:
+                        self.rng.bit_generator.state = d["rng_state"]
+                    except (ValueError, TypeError):
+                        pass
+                got = d.get("marks") or []
+                self.marks = [
+                    {"subject": str(m["subject"]), "path": str(m["path"]),
+                     "pos": int(m["pos"]),
+                     "size": (int(m["size"]) if m.get("size") is not None
+                              else None),
+                     "mtime_ns": (int(m["mtime_ns"])
+                                  if m.get("mtime_ns") is not None else None)}
+                    for m in got
+                    if isinstance(m, dict) and "subject" in m
+                    and "path" in m and "pos" in m
+                ][:self.capacity]
+            except (OSError, ValueError, KeyError, TypeError):
+                self.marks = []
+                self.seen = 0
+
+    def add(self, subject, path, pos):
+        if self.capacity <= 0:
+            return
+        self.seen += 1
+        ap = os.path.abspath(path)
+        try:
+            st = os.stat(ap)
+            size, mtime_ns = int(st.st_size), int(st.st_mtime_ns)
+        except OSError:
+            return
+        mark = {"subject": str(subject), "path": ap, "pos": int(pos),
+                "size": size, "mtime_ns": mtime_ns}
+        if len(self.marks) < self.capacity:
+            self.marks.append(mark)
+            return
+        j = int(self.rng.integers(0, self.seen))
+        if j < self.capacity:
+            self.marks[j] = mark
+
+    def should_replay(self, fraction):
+        return bool(self.marks) and self.rng.random() < float(fraction)
+
+    def sample(self):
+        """Draw an unchanged passage from the lifetime reservoir.
+
+        A file may be regenerated under the same name during a multi-day run.
+        Replaying the old offset in new contents is not replay; it is mislabeled
+        fresh data. Marks whose file size or mtime changed are evicted lazily.
+        Older persisted state without fingerprints is accepted once and then
+        skipped, rather than pretending identity can be proved.
+        """
+        while self.marks:
+            j = int(self.rng.integers(0, len(self.marks)))
+            m = self.marks[j]
+            try:
+                st = os.stat(m["path"])
+                same = (
+                    m.get("size") is not None
+                    and m.get("mtime_ns") is not None
+                    and int(st.st_size) == int(m["size"])
+                    and int(st.st_mtime_ns) == int(m["mtime_ns"])
+                )
+            except OSError:
+                same = False
+            if same:
+                return dict(m)
+            self.marks.pop(j)
+        return None
+
+    def note_replay(self):
+        self.replays += 1
+
+    def save(self):
+        if not self.state_path or self.capacity <= 0:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"version": 2, "seen": self.seen,
+                           "capacity": self.capacity,
+                           "rng_state": self.rng.bit_generator.state,
+                           "marks": self.marks}, f)
+            os.replace(tmp, self.state_path)
+        except OSError as e:
+            print(f"    (replay state not written: {e})", flush=True)
 
 
 def _lanes(files, seed, roots=None, resume=0):
@@ -581,6 +733,8 @@ def cmd_read(args):
         raise SystemExit(
             "--dwell counted SEGMENTS and is gone. Use --dwell-chars, in "
             "characters: the old default of 4 is --dwell-chars 2048.")
+    if not 0.0 <= float(args.replay) < 1.0:
+        raise SystemExit("--replay must be in [0, 1).")
 
     # EVERY CADENCE IS CONFIGURED IN CHARACTERS AND USED IN STEPS.
     #
@@ -668,19 +822,24 @@ def cmd_read(args):
                 n_off += 1
         print(f"  pool activations kept, not recomputed ({n_off} call sites) "
               f"- faster, and it needs the memory depth was using")
-    trunk, pool_ps = _split_trunk_pool(model)
+    trunk, router_ps, expert_ps = _split_trunk_router_experts(model)
 
     tg = {"params": trunk, "name": "trunk", "weight_decay": args.wd,
           "lr": args.lr * args.trunk_lr_mult,
           "base_lr": args.lr * args.trunk_lr_mult}
-    pg = {"params": pool_ps, "name": "pool", "weight_decay": args.wd,
+    rg = {"params": router_ps, "name": "routers", "weight_decay": args.wd,
+          "lr": args.lr * args.router_lr_mult,
+          "base_lr": args.lr * args.router_lr_mult}
+    eg = {"params": expert_ps, "name": "experts", "weight_decay": args.wd,
           "lr": args.lr, "base_lr": args.lr}
-    opt = torch.optim.AdamW([tg, pg], lr=args.lr, betas=(0.9, 0.95),
+    opt = torch.optim.AdamW([tg, rg, eg], lr=args.lr, betas=(0.9, 0.95),
                             fused=(device.type == "cuda"))
     snr = GradSNR()
-    print(f"  trunk learns at {args.trunk_lr_mult:g}x the pool's rate "
+    print(f"  plasticity: trunk {args.trunk_lr_mult:g}x, "
+          f"routing {args.router_lr_mult:g}x, expert content 1x "
           f"({sum(q.numel() for q in trunk)/1e6:.1f}M trunk, "
-          f"{sum(q.numel() for q in pool_ps)/1e6:.1f}M pool)")
+          f"{sum(q.numel() for q in router_ps)/1e6:.2f}M routing, "
+          f"{sum(q.numel() for q in expert_ps)/1e6:.1f}M resident experts)")
 
     # Scored at the window the model is actually reading at. A fixed
     # reference window would be steadier, but it would stop describing the
@@ -891,6 +1050,15 @@ def cmd_read(args):
     # One lane per subject, rotated a window at a time.
     lanes = _lanes(files, args.shuffle_seed, args.paths,
                    resume=int(man.get("read_chars", 0) or 0))
+    replay_mem = _ReplayMemory(
+        args.replay_marks, args.replay_state,
+        seed=[args.shuffle_seed, 7919, int(man.get("read_chars", 0) or 0)],
+    )
+    if args.replay:
+        print(f"  episodic replay {args.replay:.0%} of visits from a "
+              f"{args.replay_marks}-passage reservoir"
+              + (f" persisted at {args.replay_state}"
+                 if args.replay_state else " (session-local)"))
     # How long a subject is read for before the next one. It is a whole
     # number of context windows - a window never spans two subjects, because
     # attention across the seam where chess becomes Python teaches nothing -
@@ -968,6 +1136,8 @@ def cmd_read(args):
                                   "read_nats": nats,
                                   "plasticity": plast.state(),
                                   "context_now": ctx_now})
+        if args.replay_state:
+            replay_mem.save()
         log_history(val)
 
     stop = False
@@ -1034,11 +1204,36 @@ def cmd_read(args):
     # to be inside.
     while not stop and seen < target:
         for lane in lanes:
-            r = lane.open(model, args.chunk, ctx_now, device,
-                          turn * args.chunk)
+            mark = None
+            visit_lane = lane
+            if args.replay > 0 and replay_mem.should_replay(args.replay):
+                mark = replay_mem.sample()
+                if mark is not None:
+                    # Replay is deliberately GLOBAL, not current-subject-only.
+                    # Continual learning is the case where old subject A may no
+                    # longer be in today's input set at all. The saved path is
+                    # enough to resurrect that passage while it still exists.
+                    visit_lane = _Lane(
+                        mark["subject"], [mark["path"]], lane.rng
+                    )
+            at = ((mark["path"], int(mark["pos"]))
+                  if mark is not None else None)
+            r = visit_lane.open(model, args.chunk, ctx_now, device,
+                                turn * args.chunk, at=at)
+            if r is None and mark is not None:
+                # The old corpus may have moved or been deleted. Fall back to
+                # fresh data and do not count the failed replay attempt.
+                visit_lane = lane
+                r = lane.open(model, args.chunk, ctx_now, device,
+                              turn * args.chunk)
+            elif r is not None and mark is not None:
+                replay_mem.note_replay()
             if r is None:
                 continue
             path, data = r.name, r.data
+            start_pos = int(r.pos)
+            if args.replay > 0 and not getattr(r, "replay", False):
+                replay_mem.add(visit_lane.name, path, start_pos)
             fl = []
             for j in range(turn):
                 if r.done():
@@ -1067,7 +1262,7 @@ def cmd_read(args):
                     if tracer is not None and not tracer.done():
                         # j == 0 is the chunk that opens this lane's window -
                         # the only point where the subject actually changes
-                        tracer.add_swap(lane, moved, j == 0)
+                        tracer.add_swap(visit_lane, moved, j == 0)
                 # One rate, scaled by the plasticity controller. It moves
                 # only when held-out says something has changed - down on a
                 # plateau, back up when the ground moves - so there is no
@@ -1085,7 +1280,7 @@ def cmd_read(args):
                     with capture_routes() as got:
                         loss = r.step(learn=True, aux_weight=cfg.pool_aux)
                     if loss is not None and got:
-                        tracer.add(got, pool, lane, moved, step, float(loss),
+                        tracer.add(got, pool, visit_lane, moved, step, float(loss),
                                    seen, nxt)
                 else:
                     loss = r.step(learn=True, aux_weight=cfg.pool_aux)
@@ -1276,11 +1471,11 @@ def cmd_read(args):
                     print(f"    weights/ checkpointed at step {step:,} "
                           f"({seen/1e6:.1f}M characters)", flush=True)
                 stop = True
-            lane.rest(model)               # the window is done; free its cache
+            visit_lane.rest(model)         # the window is done; free its cache
             if fl:
                 losses.append(float(np.mean(fl)))
                 if args.verbose:
-                    print(f"  {lane.name:<12} {os.path.relpath(path):<44} "
+                    print(f"  {visit_lane.name:<12} {os.path.relpath(path):<44} "
                           f"{len(data)/1e3:>7.1f}k chars  loss {losses[-1]:.4f}",
                           flush=True)
             if stop or seen >= target:
@@ -1288,6 +1483,9 @@ def cmd_read(args):
     el = time.time() - t0
     print(f"\nread {seen/1e6:.2f}M characters in {el/60:.1f}m "
           f"({seen/max(el,1e-9)/1e3:.1f}k char/s)")
+    if args.replay:
+        print(f"  replayed {replay_mem.replays} visits; reservoir holds "
+              f"{len(replay_mem.marks)} of {replay_mem.seen} fresh passages")
     if losses:
         print(f"  mean loss over the files: {np.mean(losses):.4f}")
 
@@ -1327,6 +1525,8 @@ def cmd_read(args):
                                   "read_nats": nats,
                                   "plasticity": plast.state(),
                                   "context_now": ctx_now})
+        if args.replay_state:
+            replay_mem.save()
         print(f"  weights/ updated - the model has read this and kept it")
     else:
         print(f"  not saved (pass --save to keep what it learned)")
@@ -1795,6 +1995,59 @@ def _split_trunk_pool(model):
     return trunk, pool
 
 
+def _split_trunk_router_experts(model):
+    """Three-timescale partition for continual learning.
+
+    Expert CONTENT may adapt quickly. Routing is different: changing a router
+    can erase an old capability without touching the expert that stores it,
+    simply by no longer selecting that expert for the old input. The previous
+    two-way split put routers, segment routing and gates at the same fast rate
+    as expert content. This function makes that architectural choice explicit.
+
+    For a paged pool, w1/w3/w2 are VRAM expert slots and are expert content.
+    For a resident pool, the ModuleList of experts is expert content. Gates,
+    per-token routers, depth embeddings and the segment router are routing.
+    Everything else is the globally shared trunk.
+    """
+    p = model.pool
+    router_ids = {id(p.gate)}
+    expert_ids = set()
+
+    if hasattr(p, "experts") and p.experts is not None:
+        expert_ids |= {id(q) for e in p.experts for q in e.parameters()}
+
+    for nm in ("w1", "w3", "w2"):
+        obj = getattr(p, nm, None)
+        if obj is None:
+            continue
+        expert_ids |= ({id(obj)} if torch.is_tensor(obj)
+                       else {id(q) for q in obj.parameters()})
+
+    sr = getattr(p, "segment_router", None)
+    if sr is not None:
+        router_ids |= {id(q) for q in sr.parameters()}
+
+    for s in model.modules():
+        if isinstance(s, PooledMLP):
+            router_ids.add(id(s.router.weight))
+            router_ids.add(id(s.depth_emb))
+
+    all_ids = {id(q) for q in model.parameters()}
+    overlap = router_ids & expert_ids
+    if overlap:
+        raise RuntimeError("router/expert parameter partition overlaps")
+    trunk_ids = all_ids - router_ids - expert_ids
+
+    trunk = [q for q in model.parameters() if id(q) in trunk_ids]
+    routers = [q for q in model.parameters() if id(q) in router_ids]
+    experts = [q for q in model.parameters() if id(q) in expert_ids]
+
+    if ({id(q) for q in trunk} | {id(q) for q in routers}
+            | {id(q) for q in experts}) != all_ids:
+        raise RuntimeError("parameter partition is incomplete")
+    return trunk, routers, experts
+
+
 def build_paged(wdir, device, resident=None, ram_capacity=256, ceiling=None,
                 read_only=False):
     """
@@ -2038,6 +2291,20 @@ def main():
                          "it a chunk at a time. Distinct from model.context_end, "
                          "which is how far the model sees and how far the "
                          "gradient reaches")
+    rd.add_argument("--replay", type=float,
+                    default=_cfg(_c, "training.replay", 0.0),
+                    help="fraction of subject visits replaced by a revisit to "
+                         "a previously seen passage. Compute stays fixed: "
+                         "replay trades some new exposure for retention")
+    rd.add_argument("--replay-marks", type=int,
+                    default=_cfg(_c, "training.replay_marks", 512),
+                    help="maximum remembered passage references in the "
+                         "reservoir; stores file path + offset, not text")
+    rd.add_argument("--replay-state",
+                    default=_cfg(_c, "training.replay_state", ""),
+                    help="optional JSON file that persists replay references "
+                         "across sessions. Kept outside weights by default "
+                         "because it contains corpus file names")
     rd.add_argument("--context-end", "--context", dest="context", type=int,
                     default=_cfg(_c, "model.context_end",
                                  _cfg(_c, "model.context", 24576)),
@@ -2220,6 +2487,12 @@ def main():
                     default=_cfg(_c, "training.trunk_lr_mult", 0.3),
                     help="the trunk is shared by every domain and is where "
                          "forgetting happens; it learns slower on purpose")
+    rd.add_argument("--router-lr-mult", type=float,
+                    default=_cfg(_c, "training.router_lr_mult", 1.0),
+                    help="router/gate LR divided by expert-content LR. "
+                         "1 preserves the original mini-AGI behaviour; lower "
+                         "values consolidate routing so old inputs keep reaching "
+                         "the experts that learned them")
     rd.add_argument("--grow-mem-frac", type=float,
                     default=_cfg(_c, "growth.mem_frac", 0.85))
     rd.set_defaults(fn=cmd_read)
