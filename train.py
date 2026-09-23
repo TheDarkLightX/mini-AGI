@@ -547,9 +547,14 @@ class _ReplayMemory:
     equally likely to remain in the fixed-size memory.
     """
 
-    def __init__(self, capacity=0, state_path=""):
+    def __init__(self, capacity=0, state_path="", seed=0):
         self.capacity = max(0, int(capacity or 0))
         self.state_path = state_path or ""
+        # Replay owns its randomness. It must never advance a lane's RNG:
+        # replay=0 must reproduce the exact same fresh passages as before this
+        # feature existed, and replay>0 should replace visits without changing
+        # which fresh passage would have come next.
+        self.rng = np.random.default_rng(seed)
         self.marks = []
         self.seen = 0
         self.replays = 0
@@ -570,7 +575,7 @@ class _ReplayMemory:
                 self.marks = []
                 self.seen = 0
 
-    def add(self, subject, path, pos, rng):
+    def add(self, subject, path, pos):
         if self.capacity <= 0:
             return
         self.seen += 1
@@ -579,15 +584,18 @@ class _ReplayMemory:
         if len(self.marks) < self.capacity:
             self.marks.append(mark)
             return
-        j = int(rng.integers(0, self.seen))
+        j = int(self.rng.integers(0, self.seen))
         if j < self.capacity:
             self.marks[j] = mark
 
-    def sample(self, rng):
+    def should_replay(self, fraction):
+        return bool(self.marks) and self.rng.random() < float(fraction)
+
+    def sample(self):
         """Draw from the whole lifetime reservoir, across subject boundaries."""
         if not self.marks:
             return None
-        m = self.marks[int(rng.integers(0, len(self.marks)))]
+        m = self.marks[int(self.rng.integers(0, len(self.marks)))]
         return dict(m)
 
     def note_replay(self):
@@ -1006,7 +1014,10 @@ def cmd_read(args):
     # One lane per subject, rotated a window at a time.
     lanes = _lanes(files, args.shuffle_seed, args.paths,
                    resume=int(man.get("read_chars", 0) or 0))
-    replay_mem = _ReplayMemory(args.replay_marks, args.replay_state)
+    replay_mem = _ReplayMemory(
+        args.replay_marks, args.replay_state,
+        seed=[args.shuffle_seed, 7919, int(man.get("read_chars", 0) or 0)],
+    )
     if args.replay:
         print(f"  episodic replay {args.replay:.0%} of visits from a "
               f"{args.replay_marks}-passage reservoir"
@@ -1159,9 +1170,8 @@ def cmd_read(args):
         for lane in lanes:
             mark = None
             visit_lane = lane
-            if (args.replay > 0 and replay_mem.marks
-                    and lane.rng.random() < args.replay):
-                mark = replay_mem.sample(lane.rng)
+            if args.replay > 0 and replay_mem.should_replay(args.replay):
+                mark = replay_mem.sample()
                 if mark is not None:
                     # Replay is deliberately GLOBAL, not current-subject-only.
                     # Continual learning is the case where old subject A may no
@@ -1186,8 +1196,8 @@ def cmd_read(args):
                 continue
             path, data = r.name, r.data
             start_pos = int(r.pos)
-            if not getattr(r, "replay", False):
-                replay_mem.add(visit_lane.name, path, start_pos, lane.rng)
+            if args.replay > 0 and not getattr(r, "replay", False):
+                replay_mem.add(visit_lane.name, path, start_pos)
             fl = []
             for j in range(turn):
                 if r.done():
