@@ -37,6 +37,8 @@ jobs:
           print("continual-v2 static invariants: OK")
           PY
       - name: Install runtime dependencies
-        run: pip install torch numpy pyyaml
+        run: |
+          pip install numpy pyyaml
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Run continual V2 invariants
         run: python scripts/check_continual_v2.py
