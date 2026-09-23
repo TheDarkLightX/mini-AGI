@@ -469,19 +469,35 @@ class _Lane:
         self.r = None
         self.visits = 0
 
-    def open(self, model, chunk, block, device, span=None):
+    def open(self, model, chunk, block, device, span=None, at=None):
         """
-        Open a file for this visit.
+        Open a file for this visit, optionally at a remembered old position.
 
-        `block` is the context window; `span` is how much will be read before
-        the reader moves to another subject, which may be several windows. The
-        offset has to leave room for the whole visit, not just the first
-        window, or the file runs out part way through and the visit is cut
-        short.
+        `at=(path, position)` is episodic replay. It re-opens the same raw
+        passage the model saw before, so replay has the same context semantics
+        as first exposure instead of feeding isolated chunks with an empty
+        cache. A missing/changed file simply makes the replay miss; the caller
+        can fall back to a fresh visit.
         """
         from minagi.stream import FileReader
         from minagi.ingest import as_stream
         span = max(span or block, block)
+
+        if at is not None:
+            path, pos = at
+            try:
+                data = as_stream(path)
+            except OSError:
+                return None
+            if len(data) < 8 or int(pos) >= len(data) - 1:
+                return None
+            r = FileReader(model, data, path, chunk, block, device)
+            r.pos = max(0, int(pos))
+            r.replay = True
+            self.r = r
+            self.visits += 1
+            return r
+
         for _ in range(8):                       # a few tries for short files
             path = self.paths[int(self.rng.integers(0, len(self.paths)))]
             try:
@@ -498,6 +514,7 @@ class _Lane:
             r = FileReader(model, data, path, chunk, block, device)
             if len(data) > span + 1:
                 r.pos = int(self.rng.integers(0, len(data) - span - 1))
+            r.replay = False
             self.r = r
             self.visits += 1
             return r
@@ -516,6 +533,79 @@ class _Lane:
         if self.r is not None:
             self.r.seen = 0
             self.r = None
+
+
+class _ReplayMemory:
+    """Bounded reservoir of old passage references for task-free replay.
+
+    A mark is only (subject, path, offset), never a copy of the user's text.
+    Persistence is opt-in through --replay-state because even file names can be
+    sensitive and should not be silently embedded in a shareable model
+    checkpoint. With no state path the reservoir is session-local.
+
+    Reservoir sampling makes every fresh passage seen over the model's lifetime
+    equally likely to remain in the fixed-size memory.
+    """
+
+    def __init__(self, capacity=0, state_path=""):
+        self.capacity = max(0, int(capacity or 0))
+        self.state_path = state_path or ""
+        self.marks = []
+        self.seen = 0
+        self.replays = 0
+        if self.state_path and os.path.exists(self.state_path):
+            try:
+                with open(self.state_path) as f:
+                    d = json.load(f)
+                self.seen = int(d.get("seen", 0) or 0)
+                got = d.get("marks") or []
+                self.marks = [
+                    {"subject": str(m["subject"]), "path": str(m["path"]),
+                     "pos": int(m["pos"])}
+                    for m in got
+                    if isinstance(m, dict) and "subject" in m
+                    and "path" in m and "pos" in m
+                ][:self.capacity]
+            except (OSError, ValueError, KeyError, TypeError):
+                self.marks = []
+                self.seen = 0
+
+    def add(self, subject, path, pos, rng):
+        if self.capacity <= 0:
+            return
+        self.seen += 1
+        mark = {"subject": str(subject), "path": os.path.abspath(path),
+                "pos": int(pos)}
+        if len(self.marks) < self.capacity:
+            self.marks.append(mark)
+            return
+        j = int(rng.integers(0, self.seen))
+        if j < self.capacity:
+            self.marks[j] = mark
+
+    def sample(self, subject, rng):
+        if not self.marks:
+            return None
+        cand = [m for m in self.marks if m["subject"] == subject]
+        if not cand:
+            return None
+        m = cand[int(rng.integers(0, len(cand)))]
+        self.replays += 1
+        return m["path"], int(m["pos"])
+
+    def save(self):
+        if not self.state_path or self.capacity <= 0:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"version": 1, "seen": self.seen,
+                           "capacity": self.capacity,
+                           "marks": self.marks}, f)
+            os.replace(tmp, self.state_path)
+        except OSError as e:
+            print(f"    (replay state not written: {e})", flush=True)
 
 
 def _lanes(files, seed, roots=None, resume=0):
@@ -599,6 +689,8 @@ def cmd_read(args):
         raise SystemExit(
             "--dwell counted SEGMENTS and is gone. Use --dwell-chars, in "
             "characters: the old default of 4 is --dwell-chars 2048.")
+    if not 0.0 <= float(args.replay) < 1.0:
+        raise SystemExit("--replay must be in [0, 1).")
 
     # EVERY CADENCE IS CONFIGURED IN CHARACTERS AND USED IN STEPS.
     #
@@ -914,6 +1006,12 @@ def cmd_read(args):
     # One lane per subject, rotated a window at a time.
     lanes = _lanes(files, args.shuffle_seed, args.paths,
                    resume=int(man.get("read_chars", 0) or 0))
+    replay_mem = _ReplayMemory(args.replay_marks, args.replay_state)
+    if args.replay:
+        print(f"  episodic replay {args.replay:.0%} of visits from a "
+              f"{args.replay_marks}-passage reservoir"
+              + (f" persisted at {args.replay_state}"
+                 if args.replay_state else " (session-local)"))
     # How long a subject is read for before the next one. It is a whole
     # number of context windows - a window never spans two subjects, because
     # attention across the seam where chess becomes Python teaches nothing -
@@ -991,6 +1089,8 @@ def cmd_read(args):
                                   "read_nats": nats,
                                   "plasticity": plast.state(),
                                   "context_now": ctx_now})
+        if args.replay_state:
+            replay_mem.save()
         log_history(val)
 
     stop = False
@@ -1057,11 +1157,23 @@ def cmd_read(args):
     # to be inside.
     while not stop and seen < target:
         for lane in lanes:
+            mark = None
+            if (args.replay > 0 and replay_mem.marks
+                    and lane.rng.random() < args.replay):
+                mark = replay_mem.sample(lane.name, lane.rng)
             r = lane.open(model, args.chunk, ctx_now, device,
-                          turn * args.chunk)
+                          turn * args.chunk, at=mark)
+            if r is None and mark is not None:
+                # The corpus may have changed since this mark was recorded.
+                # A stale replay reference costs one miss, not the run.
+                r = lane.open(model, args.chunk, ctx_now, device,
+                              turn * args.chunk)
             if r is None:
                 continue
             path, data = r.name, r.data
+            start_pos = int(r.pos)
+            if not getattr(r, "replay", False):
+                replay_mem.add(lane.name, path, start_pos, lane.rng)
             fl = []
             for j in range(turn):
                 if r.done():
@@ -1311,6 +1423,9 @@ def cmd_read(args):
     el = time.time() - t0
     print(f"\nread {seen/1e6:.2f}M characters in {el/60:.1f}m "
           f"({seen/max(el,1e-9)/1e3:.1f}k char/s)")
+    if args.replay:
+        print(f"  replayed {replay_mem.replays} visits; reservoir holds "
+              f"{len(replay_mem.marks)} of {replay_mem.seen} fresh passages")
     if losses:
         print(f"  mean loss over the files: {np.mean(losses):.4f}")
 
@@ -1350,6 +1465,8 @@ def cmd_read(args):
                                   "read_nats": nats,
                                   "plasticity": plast.state(),
                                   "context_now": ctx_now})
+        if args.replay_state:
+            replay_mem.save()
         print(f"  weights/ updated - the model has read this and kept it")
     else:
         print(f"  not saved (pass --save to keep what it learned)")
@@ -2114,6 +2231,20 @@ def main():
                          "it a chunk at a time. Distinct from model.context_end, "
                          "which is how far the model sees and how far the "
                          "gradient reaches")
+    rd.add_argument("--replay", type=float,
+                    default=_cfg(_c, "training.replay", 0.0),
+                    help="fraction of subject visits replaced by a revisit to "
+                         "a previously seen passage. Compute stays fixed: "
+                         "replay trades some new exposure for retention")
+    rd.add_argument("--replay-marks", type=int,
+                    default=_cfg(_c, "training.replay_marks", 512),
+                    help="maximum remembered passage references in the "
+                         "reservoir; stores file path + offset, not text")
+    rd.add_argument("--replay-state",
+                    default=_cfg(_c, "training.replay_state", ""),
+                    help="optional JSON file that persists replay references "
+                         "across sessions. Kept outside weights by default "
+                         "because it contains corpus file names")
     rd.add_argument("--context-end", "--context", dest="context", type=int,
                     default=_cfg(_c, "model.context_end",
                                  _cfg(_c, "model.context", 24576)),
