@@ -566,7 +566,11 @@ class _ReplayMemory:
                 got = d.get("marks") or []
                 self.marks = [
                     {"subject": str(m["subject"]), "path": str(m["path"]),
-                     "pos": int(m["pos"])}
+                     "pos": int(m["pos"]),
+                     "size": (int(m["size"]) if m.get("size") is not None
+                              else None),
+                     "mtime_ns": (int(m["mtime_ns"])
+                                  if m.get("mtime_ns") is not None else None)}
                     for m in got
                     if isinstance(m, dict) and "subject" in m
                     and "path" in m and "pos" in m
@@ -579,8 +583,14 @@ class _ReplayMemory:
         if self.capacity <= 0:
             return
         self.seen += 1
-        mark = {"subject": str(subject), "path": os.path.abspath(path),
-                "pos": int(pos)}
+        ap = os.path.abspath(path)
+        try:
+            st = os.stat(ap)
+            size, mtime_ns = int(st.st_size), int(st.st_mtime_ns)
+        except OSError:
+            return
+        mark = {"subject": str(subject), "path": ap, "pos": int(pos),
+                "size": size, "mtime_ns": mtime_ns}
         if len(self.marks) < self.capacity:
             self.marks.append(mark)
             return
@@ -592,11 +602,31 @@ class _ReplayMemory:
         return bool(self.marks) and self.rng.random() < float(fraction)
 
     def sample(self):
-        """Draw from the whole lifetime reservoir, across subject boundaries."""
-        if not self.marks:
-            return None
-        m = self.marks[int(self.rng.integers(0, len(self.marks)))]
-        return dict(m)
+        """Draw an unchanged passage from the lifetime reservoir.
+
+        A file may be regenerated under the same name during a multi-day run.
+        Replaying the old offset in new contents is not replay; it is mislabeled
+        fresh data. Marks whose file size or mtime changed are evicted lazily.
+        Older persisted state without fingerprints is accepted once and then
+        skipped, rather than pretending identity can be proved.
+        """
+        while self.marks:
+            j = int(self.rng.integers(0, len(self.marks)))
+            m = self.marks[j]
+            try:
+                st = os.stat(m["path"])
+                same = (
+                    m.get("size") is not None
+                    and m.get("mtime_ns") is not None
+                    and int(st.st_size) == int(m["size"])
+                    and int(st.st_mtime_ns) == int(m["mtime_ns"])
+                )
+            except OSError:
+                same = False
+            if same:
+                return dict(m)
+            self.marks.pop(j)
+        return None
 
     def note_replay(self):
         self.replays += 1
