@@ -10,15 +10,17 @@ on:
   workflow_dispatch:
 
 jobs:
-  static-check:
+  check:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
       - name: Compile Python sources
-        run: python -m py_compile train.py minagi/*.py corpora/*.py serve.py
+        run: python -m py_compile train.py minagi/*.py corpora/*.py serve.py scripts/check_continual_v2.py
       - name: Verify V2 hooks are present
         run: |
           python - <<'PY'
@@ -35,3 +37,7 @@ jobs:
           assert "--replay-state" in text
           print("continual-v2 static invariants: OK")
           PY
+      - name: Install runtime dependencies
+        run: pip install torch numpy pyyaml
+      - name: Run continual V2 invariants
+        run: python scripts/check_continual_v2.py
